@@ -1,12 +1,6 @@
 # agents/orchestrator.py
-#
-# ROLE: The only agent ASI:One talks to directly.
-# Receives natural language from ASI:One, coordinates the other 3 agents,
-# synthesizes results, and replies.
-# WHY SEPARATE: It's the coordinator — decomposes intent, manages conversation
-# state, and presents results. Not a registry, not a matcher, not an alerter.
 
-from agents.alert_agent import NeedMatched
+from agents.alert_agent import NeedMatched, AlertStatusRequest, AlertStatusResponse
 from agents.matching_agent import MatchRequest, MatchResponse
 from agents.registry_agent import ResourceQuery, ResourceQueryResponse
 from dotenv import load_dotenv
@@ -17,18 +11,15 @@ from uagents_core.contrib.protocols.chat import (
     ChatMessage, ChatAcknowledgement, TextContent,
     EndSessionContent, chat_protocol_spec,
 )
-from uagents import Agent, Context, Protocol
+from uagents import Agent, Context, Protocol, Model
 import sys
 import os
 import json
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-# Import message models from sub-agents
-
 load_dotenv()
 
-# ⚠️ PASTE SUB-AGENT ADDRESSES HERE after running each agent once
 REGISTRY_ADDRESS = "agent1qf6mmellt3pe3cskn45vmvx8v73mcgmrvawqazf2k4thwm0f7nacjcrs09y"
 MATCHING_ADDRESS = "agent1qddsu2ldewaxw0xm2zyj6njknrzruzuc38sw76zqdx67df3ue3guqwcta97"
 ALERT_ADDRESS = "agent1qwkmk2qcgvdr7wle755gnm4j7ajjh88l4fr0t0u9prwy6pc0cfg9w0em9ac"
@@ -47,7 +38,6 @@ chat_proto = Protocol(spec=chat_protocol_spec)
 
 
 def parse_intent(query: str) -> dict:
-    """Use Claude to extract structured intent from natural language"""
     resp = claude.messages.create(
         model="claude-haiku-4-5-20251001",
         max_tokens=300,
@@ -74,38 +64,32 @@ JSON format:
   "radius_miles": 15
 }}
 
-If location is mentioned use approximate LA area coordinates.
 Default center: lat 34.1897, lng -118.1314 (Altadena area).
 Extract one need object per distinct resource type needed."""
         }]
     )
     try:
         text = resp.content[0].text.strip()
-        # Strip markdown code blocks if present
         if text.startswith("```"):
             text = text.split("```")[1]
             if text.startswith("json"):
                 text = text[4:]
         return json.loads(text.strip())
-    except Exception as e:
-        # Fallback: treat as general query for all types
+    except:
         return {
             "needs": [
-                {"description": query, "type": "shelter", "urgency": "high", "count": 1,
-                 "lat": 34.1897, "lng": -118.1314},
-                {"description": query, "type": "transport", "urgency": "high", "count": 1,
-                 "lat": 34.1897, "lng": -118.1314},
-                {"description": query, "type": "medical", "urgency": "high", "count": 1,
-                 "lat": 34.1897, "lng": -118.1314},
+                {"description": query, "type": "shelter", "urgency": "high",
+                    "count": 1, "lat": 34.1897, "lng": -118.1314},
+                {"description": query, "type": "transport", "urgency": "high",
+                    "count": 1, "lat": 34.1897, "lng": -118.1314},
+                {"description": query, "type": "medical", "urgency": "high",
+                    "count": 1, "lat": 34.1897, "lng": -118.1314},
             ],
-            "center_lat": 34.1897,
-            "center_lng": -118.1314,
-            "radius_miles": 15
+            "center_lat": 34.1897, "center_lng": -118.1314, "radius_miles": 15
         }
 
 
 def synthesize_response(query: str, assignments: list, unmet: list) -> str:
-    """Use Claude to turn raw match data into a human-readable action plan"""
     if not assignments and not unmet:
         return "No matching resources found in the area. Please broaden your search radius."
 
@@ -124,7 +108,10 @@ def synthesize_response(query: str, assignments: list, unmet: list) -> str:
     for u in unmet:
         unmet_text += f"\n❌ UNMET: {u['description']} (urgency: {u.get('urgency', 'unknown')})\n"
 
-    prompt = f"""You are Dispatch, an autonomous disaster coordination AI.
+    resp = claude.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=400,
+        messages=[{"role": "user", "content": f"""You are Dispatch, an autonomous disaster coordination AI.
 A coordinator submitted: "{query}"
 
 Resource assignments found:
@@ -137,17 +124,9 @@ Write a concise, actionable coordination plan. Format:
 1. Lead with matched resources and immediate actions
 2. For each match: what to do, who to call, how far away
 3. Flag any unmet needs clearly
-4. Keep it under 200 words. Be direct — this is an emergency."""
-
-    resp = claude.messages.create(
-        model="claude-haiku-4-5-20251001",
-        max_tokens=400,
-        messages=[{"role": "user", "content": prompt}]
+4. Keep it under 200 words. Be direct — this is an emergency."""}]
     )
     return resp.content[0].text
-
-# ── Session state helpers ────────────────────────────────────────────────────
-# We use ctx.storage to track in-flight requests since responses are async
 
 
 def get_session(ctx: Context, req_id: str) -> dict:
@@ -180,46 +159,46 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
             user_text = item.text
             break
 
-    # Skip empty messages and ASI:One's own injected responses
+    # Store sender so we can reply later
+    ctx.storage.set("last_user_sender", sender)
+
+    # Skip empty messages
     if not user_text or not user_text.strip():
         return
 
-    # Skip if this looks like it came from ASI:One's own LLM (not user)
-    if sender != ALERT_ADDRESS and len(user_text) > 500:
+    # Skip ASI:One's own LLM injections
+    if len(user_text) > 500:
         return
 
-    # If this is an alert forwarded FROM alert agent, pass straight to user
-    if sender == ALERT_ADDRESS:
-        ctx.logger.info("Forwarding alert from AlertAgent to user")
-        # Store last known user session to forward alerts to
-        last_session = ctx.storage.get("last_user_session")
-        if last_session:
-            sess = json.loads(last_session)
-            await ctx.send(sess["sender"], ChatMessage(
-                timestamp=datetime.now(timezone.utc),
-                msg_id=uuid4(),
-                content=[TextContent(type="text", text=user_text)]
-            ))
+    ctx.logger.info(f"Orchestrator received: {user_text[:80]}")
+
+    # Handle alert status queries
+    alert_keywords = ["alert", "alerts", "unmatched",
+                      "critical", "any updates", "status"]
+    if any(kw in user_text.lower() for kw in alert_keywords):
+        req_id = str(uuid4())[:8]
+        ctx.storage.set(f"alert_req_{req_id}", sender)
+        await ctx.send(ALERT_ADDRESS, AlertStatusRequest(request_id=req_id))
+        await ctx.send(sender, ChatMessage(
+            timestamp=datetime.now(timezone.utc),
+            msg_id=uuid4(),
+            content=[TextContent(
+                type="text", text="🔍 Checking alert status...")]
+        ))
         return
-
-    ctx.logger.info(f"Orchestrator received from ASI:One: {user_text[:80]}")
-
-    # Store this session so alerts can be forwarded back
-    ctx.storage.set("last_user_session", json.dumps({"sender": sender}))
 
     # Send interim message
     await ctx.send(sender, ChatMessage(
         timestamp=datetime.now(timezone.utc),
         msg_id=uuid4(),
-        content=[TextContent(type="text",
-                             text="🔍 Dispatch activated. Querying resource registry...")]
+        content=[TextContent(
+            type="text", text="🔍 Dispatch activated. Querying resource registry...")]
     ))
 
     # Parse intent
     intent = parse_intent(user_text)
     req_id = str(uuid4())[:8]
 
-    # Save session state
     save_session(ctx, req_id, {
         "original_query": user_text,
         "sender": sender,
@@ -229,7 +208,6 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
     })
     ctx.storage.set("latest_req_id", req_id)
 
-    # Step 1: Query the registry
     resource_types = list(set(n["type"] for n in intent["needs"]))
     await ctx.send(REGISTRY_ADDRESS, ResourceQuery(
         resource_types=resource_types,
@@ -245,7 +223,22 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
 async def handle_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
     pass
 
-# ── Registry response → trigger matching ────────────────────────────────────
+# ── Alert status response ─────────────────────────────────────────────────────
+
+
+@orchestrator.on_message(model=AlertStatusResponse)
+async def handle_alert_status(ctx: Context, sender: str, msg: AlertStatusResponse):
+    original_sender = ctx.storage.get(f"alert_req_{msg.request_id}")
+    if original_sender:
+        await ctx.send(original_sender, ChatMessage(
+            timestamp=datetime.now(timezone.utc),
+            msg_id=uuid4(),
+            content=[TextContent(type="text", text=msg.message)]
+        ))
+        ctx.logger.info(
+            f"Alert status delivered to user — has_alerts: {msg.has_alerts}")
+
+# ── Registry response → trigger matching ─────────────────────────────────────
 
 
 @orchestrator.on_message(model=ResourceQueryResponse)
@@ -264,23 +257,20 @@ async def handle_registry_response(ctx: Context, sender: str, msg: ResourceQuery
     session["stage"] = "waiting_matching"
     save_session(ctx, req_id, session)
 
-    # Notify user
-    user_sender = session["sender"]
-    await ctx.send(user_sender, ChatMessage(
+    await ctx.send(session["sender"], ChatMessage(
         timestamp=datetime.now(timezone.utc),
         msg_id=uuid4(),
         content=[TextContent(type="text",
                              text=f"📦 Found {len(resources)} available resources. Running matching algorithm...")]
     ))
 
-    # Step 2: Send to matching agent
     await ctx.send(MATCHING_ADDRESS, MatchRequest(
         needs=json.dumps(session["needs"]),
         resources=json.dumps(resources),
         request_id=req_id
     ))
 
-# ── Match response → synthesize and reply ───────────────────────────────────
+# ── Match response → synthesize and reply ────────────────────────────────────
 
 
 @orchestrator.on_message(model=MatchResponse)
@@ -298,28 +288,19 @@ async def handle_match_response(ctx: Context, sender: str, msg: MatchResponse):
     ctx.logger.info(
         f"Matching complete: {len(assignments)} matched, {len(unmet)} unmet")
 
-    # Mark matched needs in alert agent so it stops monitoring them
     for a in assignments:
         need_id = a["need"].get("id")
         if need_id:
             await ctx.send(ALERT_ADDRESS, NeedMatched(need_id=need_id))
 
-    # Synthesize final response with Claude
     final_response = synthesize_response(
-        session["original_query"], assignments, unmet
-    )
+        session["original_query"], assignments, unmet)
 
     await ctx.send(user_sender, ChatMessage(
         timestamp=datetime.now(timezone.utc),
         msg_id=uuid4(),
-        content=[TextContent(type="text",
-                             text=f"⚡ DISPATCH COORDINATION PLAN:\n\n{final_response}")]
-    ))
-
-    await ctx.send(user_sender, ChatMessage(
-        timestamp=datetime.now(timezone.utc),
-        msg_id=uuid4(),
-        content=[EndSessionContent(type="end-session")]
+        content=[TextContent(
+            type="text", text=f"⚡ DISPATCH COORDINATION PLAN:\n\n{final_response}")]
     ))
 
     clear_session(ctx, req_id)

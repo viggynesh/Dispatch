@@ -6,7 +6,7 @@ from uuid import uuid4
 from datetime import datetime, timezone
 from uagents_core.contrib.protocols.chat import (
     ChatMessage, ChatAcknowledgement, TextContent,
-    EndSessionContent, chat_protocol_spec,
+    chat_protocol_spec,
 )
 from uagents import Agent, Context, Model, Protocol
 import sys
@@ -16,8 +16,6 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 load_dotenv()
-
-ORCHESTRATOR_ADDRESS = "agent1q0jatv3pu2gm0ed4j9rydtqggkf952ww4c0flyt0raxw2rl0w6wtjk5u8wp"
 
 alert_agent = Agent(
     name="dispatch_alert_agent",
@@ -42,6 +40,18 @@ class NeedSubmission(Model):
 
 class NeedMatched(Model):
     need_id: str
+
+
+class AlertStatusRequest(Model):
+    """Orchestrator asks: what critical needs are currently unmatched?"""
+    request_id: str
+
+
+class AlertStatusResponse(Model):
+    """Alert agent replies with current unmatched critical needs"""
+    message: str
+    has_alerts: bool
+    request_id: str
 
 # ── Startup ──────────────────────────────────────────────────────────────────
 
@@ -88,15 +98,15 @@ async def handle_matched(ctx: Context, sender: str, msg: NeedMatched):
         ctx.storage.set("active_needs", json.dumps(needs))
         ctx.logger.info(f"Need {msg.need_id} marked as matched")
 
-# ── Autonomous escalation loop ───────────────────────────────────────────────
+# ── Answer status requests from orchestrator ─────────────────────────────────
 
 
-@alert_agent.on_interval(period=30.0)
-async def check_unmatched_critical(ctx: Context):
+@alert_agent.on_message(model=AlertStatusRequest)
+async def handle_status_request(ctx: Context, sender: str, msg: AlertStatusRequest):
     needs = json.loads(ctx.storage.get("active_needs") or "{}")
     now = datetime.now(timezone.utc)
 
-    escalations = []
+    unmatched = []
     for need in needs.values():
         if need.get("matched"):
             continue
@@ -107,39 +117,70 @@ async def check_unmatched_critical(ctx: Context):
             submitted_at = submitted_at.replace(tzinfo=timezone.utc)
         wait_seconds = (now - submitted_at).total_seconds()
         if wait_seconds >= ALERT_THRESHOLD_SECONDS:
-            escalations.append(
-                {"need": need, "wait_minutes": round(wait_seconds / 60, 1)})
+            unmatched.append({
+                **need,
+                "wait_minutes": round(wait_seconds / 60, 1)
+            })
 
-    if not escalations:
-        ctx.logger.info(
-            f"Alert check: no escalations ({len(needs)} needs monitored)")
-        return
-
-    ctx.logger.warning(
-        f"⚠️ ESCALATING {len(escalations)} unmatched critical needs!")
-
-    alert_lines = [
-        f"• [{e['need']['id']}] {e['need']['description']} — waiting {e['wait_minutes']} min — contact: {e['need']['contact']}"
-        for e in escalations
-    ]
-
-    alert_text = (
-        f"⚠️ DISPATCH ALERT — {len(escalations)} CRITICAL NEED(S) UNMATCHED\n\n"
-        f"The following urgent requests have had no resource assigned:\n\n"
-        + "\n".join(alert_lines) +
-        f"\n\nImmediate action required."
-    )
-
-    if ORCHESTRATOR_ADDRESS != "PASTE_ORCHESTRATOR_ADDRESS_HERE":
-        await ctx.send(ORCHESTRATOR_ADDRESS, ChatMessage(
-            timestamp=datetime.now(timezone.utc),
-            msg_id=uuid4(),
-            content=[TextContent(type="text", text=alert_text)]
-        ))
+    if not unmatched:
+        message = "✅ No critical unmatched needs at this time. All monitored needs are either matched or within threshold."
+        has_alerts = False
     else:
-        ctx.logger.warning(f"ALERT (no orchestrator set):\n{alert_text}")
+        lines = [
+            f"• [{n['id']}] {n['description']}\n  Waiting: {n['wait_minutes']} min | Contact: {n['contact']}"
+            for n in unmatched
+        ]
+        message = (
+            f"⚠️ {len(unmatched)} CRITICAL UNMATCHED NEED(S):\n\n"
+            + "\n\n".join(lines)
+            + "\n\nThese needs have exceeded the response threshold and require immediate attention."
+        )
+        has_alerts = True
 
-# ── Chat protocol (only for acks) ────────────────────────────────────────────
+    ctx.logger.info(
+        f"Status request answered: {len(unmatched)} unmatched critical needs")
+
+    await ctx.send(sender, AlertStatusResponse(
+        message=message,
+        has_alerts=has_alerts,
+        request_id=msg.request_id
+    ))
+
+# ── Autonomous monitoring loop (stores state, doesn't push) ──────────────────
+
+
+@alert_agent.on_interval(period=30.0)
+async def monitor_needs(ctx: Context):
+    """
+    Runs autonomously every 30 seconds.
+    Tracks escalations internally — doesn't push, waits to be asked.
+    """
+    needs = json.loads(ctx.storage.get("active_needs") or "{}")
+    now = datetime.now(timezone.utc)
+
+    escalation_count = 0
+    for need in needs.values():
+        if need.get("matched"):
+            continue
+        if need.get("urgency") != "critical":
+            continue
+        submitted_at = datetime.fromisoformat(need["submitted_at"])
+        if submitted_at.tzinfo is None:
+            submitted_at = submitted_at.replace(tzinfo=timezone.utc)
+        wait_seconds = (now - submitted_at).total_seconds()
+        if wait_seconds >= ALERT_THRESHOLD_SECONDS:
+            escalation_count += 1
+
+    if escalation_count > 0:
+        ctx.logger.warning(
+            f"⚠️ {escalation_count} critical need(s) unmatched beyond threshold — "
+            f"stored and ready to report on request"
+        )
+    else:
+        ctx.logger.info(
+            f"Monitoring {len(needs)} needs — all within threshold")
+
+# ── Chat protocol ─────────────────────────────────────────────────────────────
 
 chat_proto = Protocol(spec=chat_protocol_spec)
 
