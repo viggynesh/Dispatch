@@ -88,8 +88,8 @@ def score_match(need: dict, resource: dict) -> float:
         return 0  # wrong type = no match
 
     # 2. Capacity check
-    needed_count = need.get("count", 1)
-    if resource["available_capacity"] >= needed_count:
+    needed_count = need.get("count") or 1
+    if (resource.get("available_capacity") or 0) >= needed_count:
         score += 20
     elif resource["available_capacity"] > 0:
         score += 10  # partial capacity still useful

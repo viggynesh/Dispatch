@@ -180,6 +180,14 @@ async def handle_chat(ctx: Context, sender: str, msg: ChatMessage):
             user_text = item.text
             break
 
+    # Skip empty messages and ASI:One's own injected responses
+    if not user_text or not user_text.strip():
+        return
+
+    # Skip if this looks like it came from ASI:One's own LLM (not user)
+    if sender != ALERT_ADDRESS and len(user_text) > 500:
+        return
+
     # If this is an alert forwarded FROM alert agent, pass straight to user
     if sender == ALERT_ADDRESS:
         ctx.logger.info("Forwarding alert from AlertAgent to user")
