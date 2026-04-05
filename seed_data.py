@@ -2,7 +2,25 @@
 # Pre-loaded LA wildfire scenario data
 # This populates the ResourceRegistryAgent on startup
 
-INITIAL_RESOURCES = [
+import json
+from pathlib import Path
+
+_SCRAPED_FILE = Path(__file__).parent / "scraped_resources.json"
+
+
+def _load_scraped_resources() -> list[dict] | None:
+    """Try to load real scraped data; return None if unavailable."""
+    try:
+        if _SCRAPED_FILE.exists():
+            data = json.loads(_SCRAPED_FILE.read_text())
+            if isinstance(data, list) and len(data) > 0:
+                return data
+    except Exception:
+        pass
+    return None
+
+
+INITIAL_RESOURCES = _load_scraped_resources() or [
     {
         "id": "s001",
         "type": "shelter",
@@ -103,6 +121,11 @@ INITIAL_RESOURCES = [
         "status": "available"
     },
 ]
+
+if _load_scraped_resources():
+    print(f"[seed_data] Loaded {len(INITIAL_RESOURCES)} resources from {_SCRAPED_FILE.name}")
+else:
+    print("[seed_data] Using hardcoded fallback resources")
 
 # Active needs — simulates real disaster requests already in the system
 # AlertAgent will monitor these for unmatched critical ones
